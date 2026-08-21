@@ -1,5 +1,5 @@
 /* Custom CSS for Vencord/other to remove the (imho awful) top bar from discord. */
-/* Written by Claude */
+/* mostly written by Claude */
 
 /* Hide Discord's top bar */
 div[class^="bar_"] {
