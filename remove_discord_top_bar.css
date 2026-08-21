@@ -1,0 +1,16 @@
+/* Custom CSS for Vencord/other to remove the (imho awful) top bar from discord. */
+/* Written by Claude */
+
+/* Hide Discord's top bar */
+div[class^="bar_"] {
+    display: none;
+}
+
+:root {
+    --custom-app-top-bar-height: 0px;
+}
+
+/* Add padding above the server list (Friends/DM button) */
+div[class^="tutorialContainer_"] {
+    padding-top: 12px;
+}
