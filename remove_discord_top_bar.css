@@ -14,3 +14,9 @@ div[class^="bar_"] {
 div[class^="tutorialContainer_"] {
     padding-top: 12px;
 }
+
+/* hides gift button */
+div[class^="container__5287f"]{
+    display: none;
+
+}
