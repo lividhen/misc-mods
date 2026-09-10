@@ -12,6 +12,6 @@ Removes discord's top bar/title bar thing and some other stuff.
 
 ### quest_network_interface.sh
 
-A port of [UbootVRC/Wired-Steam-Link-VR](https://github.com/UbootVRC/) for linux. Lets you do wired steam vr link.
+A port of [UbootVRC/Wired-Steam-Link-VR](https://github.com/UbootVRC/) for linux. Lets you do wired steam vr link. The option to let apps connect over usb under the link category in settings must be disabled.
 
 ---
