@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
 #
-# IMPORTANT
-# This is a linux port of the repository here https://github.com/UbootVRC/Wired-Steam-Link-VR/
-# Almost entirely ported by claude
-#
 # Quest USB NCM Link (Linux)
 # --------------------------
 # Puts the headset's USB port into NCM (USB Ethernet) mode and gives the
@@ -53,8 +49,21 @@
 #     all app traffic regardless of routing - if the link looks perfect but
 #     Steam Link still can't see the PC, check for that.
 #
+#   * UPDATE (observed on a later Horizon OS build, same Quest 2, build
+#     52433670036000520): the DHCP-broadcast behavior above stopped
+#     happening. A new system service, oculus.internal.EthernetOverUsbService,
+#     now self-assigns usb0 a static point-to-point address (seen: a /29 with
+#     no default route) the instant NCM comes up - no DHCPDISCOVER, no
+#     IpClient/DhcpClient log activity at all. This script now checks for
+#     that first: if the headset already has an address on usb0 within a few
+#     seconds, it mirrors that subnet statically instead of serving DHCP into
+#     a void. If no self-assigned address shows up (older builds, or this
+#     behavior reverting in a future update), it falls back to the original
+#     DHCP-server approach unchanged.
+#
 # Requirements: adb, ip (iproute2), dnsmasq, iptables. nmcli is optional but
-# recommended (see above). Run as root, or the script will re-exec itself
+# recommended (see above). dnsmasq is only actually invoked in the DHCP
+# fallback path - see above. Run as root, or the script will re-exec itself
 # with sudo.
 
 set -uo pipefail
@@ -171,6 +180,46 @@ add_fw_rule() {
     FW_RULES+=("-A $* -m comment --comment $FW_COMMENT")
 }
 
+# ----- helpers for mirroring a headset self-assigned static address -----
+ip_to_int() {
+    local IFS=.
+    local -a o
+    read -r -a o <<< "$1"
+    echo $(( (o[0]<<24) + (o[1]<<16) + (o[2]<<8) + o[3] ))
+}
+int_to_ip() {
+    local i=$1
+    echo "$(( (i>>24)&255 )).$(( (i>>16)&255 )).$(( (i>>8)&255 )).$(( i&255 ))"
+}
+# Given "10.86.13.37/29" (the headset's own address), work out the network,
+# and pick a free address in the same subnet for this PC to use - skipping
+# the headset's own address, and the network/broadcast addresses.
+parse_and_configure_static() {
+    local ip_prefix="$1"
+    local hip="${ip_prefix%/*}"
+    local plen="${ip_prefix#*/}"
+    local hip_int mask net_int bcast_int cand
+
+    hip_int=$(ip_to_int "$hip")
+    mask=$(( plen == 0 ? 0 : (0xFFFFFFFF << (32 - plen)) & 0xFFFFFFFF ))
+    net_int=$(( hip_int & mask ))
+    bcast_int=$(( net_int | (~mask & 0xFFFFFFFF) ))
+
+    cand=$(( net_int + 1 ))
+    PC_IP=""
+    while [[ $cand -lt $bcast_int ]]; do
+        if [[ $cand -ne $hip_int ]]; then
+            PC_IP="$(int_to_ip "$cand")"
+            break
+        fi
+        cand=$(( cand + 1 ))
+    done
+
+    PREFIX_LEN="$plen"
+    SUBNET_CIDR="$(int_to_ip "$net_int")/$plen"
+    HEADSET_IP="$hip"
+}
+
 # ------------------------------------------------------------- 1. find adb
 say_step() { say "$*"; }
 
@@ -251,8 +300,37 @@ if command -v nmcli >/dev/null 2>&1; then
     nmcli device set "$IFACE" managed no >/dev/null 2>&1
 fi
 
+# Check whether the headset has already self-assigned itself an address on
+# usb0 (see the header comment) before falling back to serving DHCP. This is
+# the new normal on at least one Horizon OS build; older builds won't show
+# anything here and we fall through to DHCP unchanged.
+STATIC_MODE=0
+HEADSET_IP=""
+for _ in $(seq 1 6); do
+    sleep 1
+    addr_line="$("$ADB" -s "$SERIAL" shell "ip -o -4 addr show usb0" 2>&1)"
+    if [[ "$addr_line" =~ inet[[:space:]]([0-9.]+/[0-9]+) ]]; then
+        STATIC_MODE=1
+        parse_and_configure_static "${BASH_REMATCH[1]}"
+        break
+    fi
+done
+
 # --------------------------------------------------- 3. address PC side
-say "[3/5] Configuring the PC end (${PC_IP}/${PREFIX_LEN})..."
+if [[ $STATIC_MODE -eq 1 ]]; then
+    if [[ -z "$PC_IP" ]]; then
+        fail "      Headset claimed ${HEADSET_IP} but its /${PREFIX_LEN} has no"
+        fail "      free address left for this PC - can't happen with a /29"
+        fail "      unless something's very unusual. Bailing out."
+        exit 1
+    fi
+    ok "      Headset self-assigned ${HEADSET_IP}/${PREFIX_LEN} on usb0 -"
+    ok "      mirroring it statically, no DHCP needed"
+    say "[3/5] Configuring the PC end (${PC_IP}/${PREFIX_LEN})..."
+else
+    say "[3/5] No self-assigned address seen - configuring the PC end"
+    say "      (${PC_IP}/${PREFIX_LEN}) and falling back to DHCP..."
+fi
 ip link set dev "$IFACE" up
 ip addr flush dev "$IFACE" 2>/dev/null
 ip addr add "${PC_IP}/${PREFIX_LEN}" dev "$IFACE"
@@ -297,47 +375,61 @@ if [[ $WIFI_OFF -eq 0 ]]; then
     fi
 fi
 
-# ------------------------------------------------- 4. serve DHCP on the link
-say "[4/5] Serving DHCP on the link..."
-if ! command -v dnsmasq >/dev/null 2>&1; then
-    fail "      dnsmasq was not found."
-    say  "      Install it, e.g.: sudo apt install dnsmasq"
-    exit 1
-fi
+if [[ $STATIC_MODE -eq 1 ]]; then
+    # ------------------------------------------- 4-5. verify, no DHCP needed
+    say "[4/5] No DHCP needed - headset already has an address."
+    say "[5/5] Verifying the link..."
+    leased=0
+    for _ in $(seq 1 20); do
+        sleep 1
+        if ping -c1 -W1 "$HEADSET_IP" >/dev/null 2>&1; then leased=1; break; fi
+    done
+else
+    # ------------------------------------------------- 4. serve DHCP on the link
+    say "[4/5] Serving DHCP on the link..."
+    if ! command -v dnsmasq >/dev/null 2>&1; then
+        fail "      dnsmasq was not found."
+        say  "      Install it, e.g.: sudo apt install dnsmasq"
+        exit 1
+    fi
 
-dnsmasq \
-    --conf-file=/dev/null \
-    --no-daemon \
-    --interface="$IFACE" \
-    --bind-interfaces \
-    --except-interface=lo \
-    --port=0 \
-    --dhcp-range="${DHCP_RANGE_LOW},${DHCP_RANGE_HIGH},255.255.255.0,${LEASE_TIME}" \
-    --dhcp-option=option:dns-server,"${DNS_SERVERS}" \
-    --dhcp-option=option:router,"${PC_IP}" \
-    --dhcp-leasefile="$LEASE_FILE" \
-    --log-dhcp \
-    --log-facility="$DNSMASQ_LOG" \
-    >/dev/null 2>&1 &
-DNSMASQ_PID=$!
-sleep 1
-if ! kill -0 "$DNSMASQ_PID" 2>/dev/null; then
-    fail "      dnsmasq failed to start. Log:"
-    tail -n 20 "$DNSMASQ_LOG" 2>/dev/null | sed 's/^/      /'
-    say  "      A likely cause: something else already owns UDP 67"
-    say  "      (another DHCP server, e.g. from a VM bridge or router-mode NM)."
-    say  "      Check with: sudo ss -ulpn | grep :67"
-    exit 1
-fi
+    dnsmasq \
+        --no-daemon \
+        --interface="$IFACE" \
+        --bind-interfaces \
+        --except-interface=lo \
+        --port=0 \
+        --dhcp-range="${DHCP_RANGE_LOW},${DHCP_RANGE_HIGH},255.255.255.0,${LEASE_TIME}" \
+        --dhcp-option=option:dns-server,"${DNS_SERVERS}" \
+        --dhcp-option=option:router,"${PC_IP}" \
+        --dhcp-leasefile="$LEASE_FILE" \
+        --log-dhcp \
+        --log-facility="$DNSMASQ_LOG" \
+        >/dev/null 2>&1 &
+    DNSMASQ_PID=$!
+    sleep 1
+    if ! kill -0 "$DNSMASQ_PID" 2>/dev/null; then
+        fail "      dnsmasq failed to start. Log:"
+        tail -n 20 "$DNSMASQ_LOG" 2>/dev/null | sed 's/^/      /'
+        say  "      A likely cause: something else already owns UDP 67"
+        say  "      (another DHCP server, e.g. from a VM bridge or router-mode NM)."
+        say  "      Check with: sudo ss -ulpn | grep :67"
+        exit 1
+    fi
 
-# ------------------------------------------------ 5. wait for the lease
-say "[5/5] Waiting for the headset to take the lease..."
-leased=0
-for _ in $(seq 1 40); do
-    sleep 2
-    addr="$("$ADB" -s "$SERIAL" shell "ip -o -4 addr show usb0" 2>&1)"
-    if [[ "$addr" == *"${SUBNET_BASE}."* ]]; then leased=1; break; fi
-done
+    # ------------------------------------------------ 5. wait for the lease
+    say "[5/5] Waiting for the headset to take the lease..."
+    leased=0
+    for _ in $(seq 1 40); do
+        sleep 2
+        addr="$("$ADB" -s "$SERIAL" shell "ip -o -4 addr show usb0" 2>&1)"
+        if [[ "$addr" == *"${SUBNET_BASE}."* ]]; then
+            leased=1
+            HEADSET_IP="$(echo "$addr" | grep -oE "${SUBNET_BASE}\.[0-9]+" | head -n1)"
+            break
+        fi
+    done
+fi
 
 # Without NAT, the cable can't pass Android's internet check, so Wi-Fi stays
 # the default network and the cable goes unused. Switching Wi-Fi off makes
@@ -355,7 +447,7 @@ echo "  ----------------------------------------------------------"
 if [[ $leased -eq 1 ]]; then
     ok "  Link is up."
     echo ""
-    echo "        Headset : $(grep -oE "${SUBNET_BASE}\.[0-9]+" "$LEASE_FILE" 2>/dev/null | head -n1)"
+    echo "        Headset : $HEADSET_IP"
     echo "        This PC : $PC_IP"
     echo ""
 
@@ -376,6 +468,12 @@ if [[ $leased -eq 1 ]]; then
     fi
     echo ""
     say "  In Steam Link, connect to $PC_IP"
+elif [[ $STATIC_MODE -eq 1 ]]; then
+    fail "  Headset has an address ($HEADSET_IP) but never answered a ping."
+    echo ""
+    say "  The interface came up but something's blocking traffic. Check:"
+    say "      sudo iptables -L INPUT -n -v | grep $IFACE"
+    say "      adb shell dumpsys connectivity | grep -iA5 ethernet"
 else
     fail "  The headset never took a lease."
     echo ""
@@ -388,8 +486,19 @@ fi
 echo "  ----------------------------------------------------------"
 
 echo ""
-echo "  =========================================================="
-echo "  Leave this window open while you play."
-echo "  Press any key here to restore normal USB mode."
-echo "  =========================================================="
-read -n 1 -s -r
+if [[ -t 0 ]]; then
+    echo "  =========================================================="
+    echo "  Leave this window open while you play."
+    echo "  Press any key here to restore normal USB mode."
+    echo "  =========================================================="
+    read -n 1 -s -r
+else
+    # No terminal attached (e.g. running as a systemd service). Idle until
+    # something sends SIGTERM/SIGINT - 'systemctl stop', for instance - at
+    # which point the trap above runs restore_everything.
+    echo "  =========================================================="
+    echo "  Running headless. Stop with:"
+    echo "    systemctl stop quest-ncm-link.service"
+    echo "  =========================================================="
+    while true; do sleep 3600 & wait $!; done
+fi
