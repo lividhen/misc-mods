@@ -20,7 +20,9 @@ A port of [UbootVRC/Wired-Steam-Link-VR](https://github.com/UbootVRC/) for linux
 
 Oops! Uploaded all the thumbnails from a backup to your immich library? I would never!
 
-Usage: `python immich_dedupe_by_metadata.py --url <immich_url> --api-key <api_key> --max-dimension 400 --aspect-tolerance 0.02 --min-keeper-dimension 800 --execute`
+Usage: `python immich_dedupe_by_metadata.py --url <immich_url> --api-key <api_key> --max-dimension 400 --aspect-tolerance 0.02 --min-keeper-dimension 800`
+
+This will do a dry run. Use `--execute` to move the assets to the trash.
 
 Options:
 ```
