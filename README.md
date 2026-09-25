@@ -34,3 +34,5 @@ Options:
 --force, Permanently delete instead of moving to trash.
 --report, default="dedupe_report.csv"
 ```
+
+---
